@@ -1,18 +1,32 @@
-import fitz
+import pymupdf
+from pathlib import Path
+
+
+def extract_pages_from_file(file_path):
+    file_path = Path(file_path)
+    if file_path.suffix.lower() == ".pdf":
+        try:
+            with pymupdf.open(
+                stream=file_path.read_bytes(),
+                filetype="pdf",
+            ) as document:
+                if document.needs_pass:
+                    raise ValueError("Password-protected PDFs are not supported.")
+                return [
+                    (page_number, page.get_text())
+                    for page_number, page in enumerate(document, start=1)
+                ]
+        except pymupdf.FileDataError as error:
+            raise ValueError("The uploaded PDF is damaged or invalid.") from error
+    if file_path.suffix.lower() == ".txt":
+        with file_path.open("r", encoding="utf-8-sig") as source_file:
+            return [(1, source_file.read())]
+    raise ValueError("Only PDF and TXT files are supported.")
+
+
 def extract_text_from_pdf(pdf_path):
-    document = fitz.open(pdf_path)
-    text = ""
-    for page in document:
-        text += page.get_text()
-    document.close()
-    return text
+    return "\n".join(text for _, text in extract_pages_from_file(pdf_path))
 
-pdf_path = "data/documents/BDA 2 marks.pdf"
 
-from chunker import create_chunks
-text = extract_text_from_pdf(pdf_path)
-chunks = create_chunks(text)
-print("Total characters:", len(text))
-print("Total chunks:", len(chunks))
-print("\nFIRST CHUNK:")
-print(chunks[0])
+def extract_text_from_file(file_path):
+    return "\n".join(text for _, text in extract_pages_from_file(file_path))

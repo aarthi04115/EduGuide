@@ -3,17 +3,21 @@ import numpy as np
 
 
 def create_index(embeddings):
-    dimension = embeddings.shape[1]
+    vectors = np.asarray(embeddings, dtype="float32").copy()
+    faiss.normalize_L2(vectors)
+    dimension = vectors.shape[1]
 
     index = faiss.IndexFlatL2(dimension)
 
-    index.add(np.array(embeddings).astype("float32"))
+    index.add(vectors)
 
     return index
 
 def search(index, query_embedding, top_k=3):
+    queries = np.asarray(query_embedding, dtype="float32").copy()
+    faiss.normalize_L2(queries)
     distances, indices = index.search(
-        np.array(query_embedding).astype("float32"),
+        queries,
         top_k
     )
 
