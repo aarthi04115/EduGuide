@@ -4,6 +4,10 @@
 # Python virtual environment
 venv/
 .venv/
+edu/
+.edu/
+node_modules/
+frontend/dist/
 
 # Python cache
 __pycache__/
@@ -14,3 +18,11 @@ __pycache__/
 
 # Generated vector database
 data/vectorstore/
+backend/data/uploads/
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Local files
+.DS_Store

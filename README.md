@@ -16,6 +16,10 @@ Instead of relying only on the LLM's general knowledge, EduGuide retrieves relev
 * ⚡ FastAPI backend
 * 📖 Context-grounded academic responses
 * 🔐 Environment-based API key management
+* 👤 Argon2 student accounts with revocable, HttpOnly-cookie sessions
+* 💬 PostgreSQL conversation and message history
+* 🔒 Account-owned conversations and private study materials
+* 🧱 Alembic-managed additive database migrations
 
 ---
 
@@ -120,8 +124,11 @@ The LLM generates an answer based primarily on the provided academic material.
 | Text Embeddings      | Sentence Transformers |
 | Embedding Model      | all-MiniLM-L6-v2      |
 | Vector Search        | FAISS                 |
-| LLM Access           | OpenRouter            |
+| LLM Access           | Groq                  |
 | LLM Client           | OpenAI Python SDK     |
+| Database             | PostgreSQL + SQLAlchemy |
+| Migrations           | Alembic               |
+| Authentication       | Argon2 + signed HttpOnly cookies |
 | API Documentation    | Swagger / OpenAPI     |
 | Version Control      | Git + GitHub          |
 
@@ -133,12 +140,22 @@ The LLM generates an answer based primarily on the provided academic material.
 EduGuide/
 │
 ├── .env
+├── .env.example
 ├── .gitignore
 ├── README.md
 │
 └── backend/
     │
     ├── main.py
+    ├── auth.py
+    ├── database.py
+    ├── models.py
+    ├── schemas.py
+    ├── security.py
+    ├── study_materials.py
+    ├── alembic/
+    ├── alembic.ini
+    ├── requirements.txt
     ├── llm_service.py
     ├── rag_pipeline.py
     ├── document_processor.py
@@ -205,7 +222,7 @@ FAISS IndexFlatL2
 
 ### `llm_service.py`
 
-Connects EduGuide to an LLM through OpenRouter.
+Connects EduGuide to Groq using its OpenAI-compatible API.
 
 The LLM receives:
 
@@ -293,52 +310,98 @@ venv\Scripts\activate
 
 ### 3. Install dependencies
 
-Install the required packages:
+Install the backend dependencies:
 
 ```bash
-pip install fastapi uvicorn pymupdf sentence-transformers faiss-cpu openai python-dotenv
+pip install -r backend/requirements.txt
 ```
 
-### 4. Configure the API key
+### 4. Configure the application
 
-Create a `.env` file in the project root:
-
-```text
-OPENROUTER_API_KEY=your_api_key_here
-```
-
-**Never commit your `.env` file or expose your API key publicly.**
-
-### 5. Start the backend
-
-From the `backend` directory:
+Copy the example configuration into a root `.env` file, then set the Groq API key, a strong random JWT secret, and the connection string for the **existing** `eduguide_db` PostgreSQL database. Configuration lookup checks the process environment first, then the repository-root `.env`, then `backend/.env`; use one authoritative `DATABASE_URL` to avoid ambiguity.
 
 ```powershell
-cd backend
-uvicorn main:app --reload
+Copy-Item .env.example .env
+python -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-### 6. Open the API documentation
+Put the generated value in `JWT_SECRET_KEY` in `.env`. `DATABASE_URL` uses the `postgresql+psycopg://` scheme and must point to an already-created database; the application and migration do not create or recreate the database. URL-encode reserved characters in the database username/password (for example, `@` becomes `%40`) rather than placing raw reserved characters in the URL. Never commit `.env`, expose the Groq key, or use a predictable JWT secret. The example defaults are for local HTTP development; set `COOKIE_SECURE=true` when serving over HTTPS. Keep the frontend and backend on the same hostname locally (`localhost`) so the browser sends the session cookie consistently.
+
+`GROQ_MODEL` is optional and defaults to `openai/gpt-oss-120b`. `ACCESS_TOKEN_EXPIRE_MINUTES` defaults to 30. `COOKIE_SAMESITE` defaults to `lax`, and `EDUGUIDE_CORS_ORIGINS` defaults to the local Vite origin.
+
+### 5. Apply the database migration
+
+After confirming that `DATABASE_URL` targets the intended existing database and that a current backup is available, apply the additive Alembic migration once from the repository root:
+
+```powershell
+Push-Location .\backend
+python -m alembic upgrade head
+python -m alembic current
+Pop-Location
+```
+
+The migrations create the `users`, `auth_sessions`, `conversations`, `messages`, `documents`, `conversation_documents`, `college_sources`, and `college_chunks` tables and add persisted source metadata to messages. They do not create the PostgreSQL database. Revision `20261004_0002` adds conversation-scoped document associations and message source metadata; revision `20261004_0003` adds the shared official-college knowledge base. Both revisions are additive and preserve existing records.
+
+### 6. Start the backend
+
+From the repository root:
+
+```powershell
+Push-Location .\backend
+python -m uvicorn main:app --reload
+Pop-Location
+```
+
+The API includes `GET /` and `GET /health/ready`, authentication endpoints (`POST /auth/register`, `POST /auth/login`, `GET /auth/me`, `POST /auth/logout`), conversation/history endpoints (`GET` and `POST /conversations`, `GET /conversations/{id}/messages`, `GET` and `POST /conversations/{id}/documents`, `DELETE /conversations/{id}/documents/{document_id}`, `PATCH` and `DELETE /conversations/{id}`), `POST /chat`, and authenticated document endpoints (`GET /documents`, `POST /documents/upload`, `DELETE /documents/{id}`). Mutating requests use the CSRF token bootstrapped from `GET /auth/csrf`. Uploads accept PDF and TXT files up to 10 MB, are privately stored, indexed synchronously, and associated with the active conversation.
+
+An uploaded PDF is extracted page by page; extracted text is chunked and indexed with the existing local FAISS architecture. Its generated storage path, owner, indexing status, and conversation association are stored in PostgreSQL. Indexes are rebuilt from owned files at backend startup. Chat retrieval filters to the active conversation's associated documents and the authenticated owner, and message source metadata (including page numbers when available) is persisted with the assistant response. Apply database changes with `python -m alembic upgrade head` before starting the backend.
+
+### 8. Import official college website information
+
+The bounded crawler imports relevant public HTML pages from `https://sairam.edu.in/` into the shared `college_sources` and `college_chunks` tables. It checks each approved host's `robots.txt`, follows sitemap entries when available, falls back to relevant links on the homepage, restricts requests to the official apex/`www` hosts, and defaults to at most 100 pages with a one-second per-request delay. It does not bypass access controls. Existing college content is retained as stale if a later fetch fails; changed content replaces that URL's old chunks, and exact duplicate page text is not indexed twice.
+
+Run these commands from the repository root after applying Alembic migrations. First inspect the capped dry-run bundle; dry runs make no database writes:
+
+```powershell
+Push-Location .\backend
+python -m ingestion.ingest_college_website --max-pages 50 --delay-seconds 1 --dry-run --export-dir .\data\college-review
+Pop-Location
+```
+
+Review `backend\data\college-review\manifest.json` and `college-pages.jsonl`. If the discovered pages and extracted text are appropriate, run the same capped crawl without `--dry-run` to index them:
+
+```powershell
+python -m ingestion.ingest_college_website --max-pages 50 --delay-seconds 1 --export-dir .\data\college-review
+python -m ingestion.ingest_college_website --stats
+Pop-Location
+```
+
+Use `--include-pdfs` to include linked public PDFs; each file remains subject to the crawler's 15 MiB limit and robots checks. To refresh the indexed content, rerun the import command. Retrieval keeps official college sources separate from private student uploads and attaches a source title/URL only when that page contributed retrieved context. Pages blocked by robots, inaccessible pages, JavaScript-only content, and PDFs unless explicitly enabled are not imported; inspect the manifest's `failures` list. The crawler is capped and intended for repeatable updates, not an unrestricted full-site mirror.
+
+After import, test questions such as “Which undergraduate programmes are offered?”, “What contact information does the college publish?”, and “Where can I find the academic calendar?” The answer should include a source link when relevant indexed college content is retrieved; it should not invent unavailable policies or details.
+
+### 9. Start the frontend
+
+In another terminal:
+
+```powershell
+Set-Location frontend
+Copy-Item .env.example .env
+npm ci
+npm run dev
+```
+
+The default backend URL is `http://localhost:8000`. Override it in `frontend/.env` with `VITE_API_BASE_URL` if needed. `VITE_API_BASE_URL` is a public URL only; do not put Groq keys, database credentials, or JWT secrets in frontend environment variables.
+
+### 10. Open the API documentation
 
 Open:
 
 ```text
-http://127.0.0.1:8000/docs
+http://localhost:8000/docs
 ```
 
-Use:
-
-```text
-POST /chat
-```
-
-with:
-
-```json
-{
-  "question": "What is Big Data?"
-}
-```
+The React application restores the session using `/auth/me`, lists conversation summaries after sign-in, and fetches message history only when a conversation is selected. Chat history and uploaded document metadata are persisted in PostgreSQL and restricted to their owner. The Groq API key remains server-side; authentication uses HttpOnly cookies and CSRF protection.
 
 ---
 
@@ -416,7 +479,12 @@ These features will be added incrementally as the project develops.
 * [x] LLM integration
 * [x] RAG pipeline
 * [x] FastAPI `/chat` endpoint
-* [x] Swagger API testing
+* [x] Groq API integration
+* [x] Student registration, login, current profile, and logout
+* [x] PostgreSQL conversation and message persistence
+* [x] Conversation ownership and history restore
+* [x] Authenticated PDF/TXT upload and document-scoped retrieval
+* [x] Alembic migration and isolated auth/history tests
 
 ### In Development
 
