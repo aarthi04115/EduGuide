@@ -5,7 +5,7 @@ def extract_text_from_pdf(pdf_path):
     for page in document:
         text += page.get_text()
     document.close()
-    return extract_text_from_pdf
+    return text
 
 pdf_path = "data/documents/BDA 2 marks.pdf"
 

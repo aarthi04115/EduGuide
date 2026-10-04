@@ -120,7 +120,7 @@ The LLM generates an answer based primarily on the provided academic material.
 | Text Embeddings      | Sentence Transformers |
 | Embedding Model      | all-MiniLM-L6-v2      |
 | Vector Search        | FAISS                 |
-| LLM Access           | OpenRouter            |
+| LLM Access           | Groq                  |
 | LLM Client           | OpenAI Python SDK     |
 | API Documentation    | Swagger / OpenAPI     |
 | Version Control      | Git + GitHub          |
@@ -205,7 +205,7 @@ FAISS IndexFlatL2
 
 ### `llm_service.py`
 
-Connects EduGuide to an LLM through OpenRouter.
+Connects EduGuide to Groq using its OpenAI-compatible API.
 
 The LLM receives:
 
@@ -301,11 +301,14 @@ pip install fastapi uvicorn pymupdf sentence-transformers faiss-cpu openai pytho
 
 ### 4. Configure the API key
 
-Create a `.env` file in the project root:
+Create a `.env` file in the project root and add your Groq API key:
 
 ```text
-OPENROUTER_API_KEY=your_api_key_here
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_MODEL=openai/gpt-oss-120b
 ```
+
+`GROQ_MODEL` is optional; it defaults to `openai/gpt-oss-120b`. Set it to another model ID available to your Groq account if needed.
 
 **Never commit your `.env` file or expose your API key publicly.**
 

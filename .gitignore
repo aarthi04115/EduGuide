@@ -4,6 +4,8 @@
 # Python virtual environment
 venv/
 .venv/
+edu/
+.edu/
 
 # Python cache
 __pycache__/
