@@ -20,8 +20,13 @@ from sqlalchemy.pool import StaticPool
 import pymupdf
 
 from database import Base, get_db, _normalize_database_url
-from models import Document
-from study_materials import get_material, remove_material, retrieve_context_with_sources
+from models import Document, User
+from study_materials import (
+    get_material,
+    initialize_materials,
+    remove_material,
+    retrieve_context_with_sources,
+)
 import main
 
 
@@ -78,6 +83,35 @@ class AuthenticationHistoryTests(unittest.TestCase):
         response = self.client.get("/health/ready")
         self.assertEqual(response.status_code, 503)
         self.assertIn("migration", response.json()["detail"].lower())
+
+    def test_initialize_materials_counts_without_restoring_indexes(self):
+        with self.session_factory() as db:
+            db.add(
+                User(
+                    id="startup-user",
+                    name="Startup Test",
+                    email="startup@example.edu",
+                    password_hash="not-used",
+                )
+            )
+            db.add(
+                Document(
+                    id="startup-document",
+                    user_id="startup-user",
+                    filename="material.txt",
+                    storage_path="missing-material.txt",
+                    status="indexed",
+                    file_size=10,
+                )
+            )
+            db.commit()
+
+            with patch(
+                "study_materials.create_embeddings",
+                side_effect=AssertionError("startup must not embed documents"),
+            ):
+                self.assertEqual(initialize_materials(db), 1)
+            self.assertIsNone(get_material("startup-document", "startup-user"))
 
     def setUp(self):
         self.engine = create_engine(

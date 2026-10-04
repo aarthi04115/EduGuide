@@ -1,13 +1,15 @@
 import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import RLock
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from embeddings import create_embeddings
+from index_cache import create_index_for_chunks
 from models import CollegeChunk, CollegeSource
-from retriever import create_index, search
+from retriever import search
 
 
 MAX_COLLEGE_RETRIEVAL_DISTANCE = 1.3
@@ -27,6 +29,7 @@ class IndexedCollegeChunk:
 _chunks: list[IndexedCollegeChunk] = []
 _index = None
 _index_version = None
+_index_lock = RLock()
 
 
 def _stable_hash(value: str) -> str:
@@ -35,34 +38,37 @@ def _stable_hash(value: str) -> str:
 
 def rebuild_college_index(db: Session) -> int:
     global _chunks, _index, _index_version
-    version = _database_version(db)
-    rows = db.execute(
-        select(CollegeChunk, CollegeSource)
-        .join(CollegeSource, CollegeSource.id == CollegeChunk.source_id)
-        .where(CollegeSource.status == "indexed")
-        .order_by(CollegeSource.source_url, CollegeChunk.chunk_index)
-    ).all()
-    chunks = [
-        IndexedCollegeChunk(
-            content=chunk.content,
-            source_id=source.id,
-            source_url=source.source_url,
-            page_title=source.page_title,
-            chunk_index=chunk.chunk_index,
+    with _index_lock:
+        version = _database_version(db)
+        rows = db.execute(
+            select(CollegeChunk, CollegeSource)
+            .join(CollegeSource, CollegeSource.id == CollegeChunk.source_id)
+            .where(CollegeSource.status == "indexed")
+            .order_by(CollegeSource.source_url, CollegeChunk.chunk_index)
+        ).yield_per(256)
+        chunks = [
+            IndexedCollegeChunk(
+                content=chunk.content,
+                source_id=source.id,
+                source_url=source.source_url,
+                page_title=source.page_title,
+                chunk_index=chunk.chunk_index,
+            )
+            for chunk, source in rows
+        ]
+        if not chunks:
+            _chunks = []
+            _index = None
+            _index_version = version
+            return 0
+        index = create_index_for_chunks(
+            [chunk.content for chunk in chunks],
+            create_embeddings,
         )
-        for chunk, source in rows
-    ]
-    if not chunks:
-        _chunks = []
-        _index = None
+        _chunks = chunks
+        _index = index
         _index_version = version
-        return 0
-    embeddings = create_embeddings([chunk.content for chunk in chunks])
-    index = create_index(embeddings)
-    _chunks = chunks
-    _index = index
-    _index_version = version
-    return len(chunks)
+        return len(chunks)
 
 
 def _database_version(db: Session):
@@ -88,45 +94,46 @@ def _database_version(db: Session):
 
 
 def retrieve_college_context(question: str, db: Session | None = None):
-    if db is not None and _index_version != _database_version(db):
-        rebuild_college_index(db)
-    if _index is None or not _chunks:
-        return "", []
-    query_embedding = create_embeddings([question])
-    distances, indices = search(
-        _index,
-        query_embedding,
-        top_k=min(MAX_COLLEGE_RETRIEVAL_CHUNKS, len(_chunks)),
-    )
-    context_parts = []
-    sources = []
-    seen_sources = set()
-    for distance, chunk_position in zip(distances[0], indices[0]):
-        if (
-            chunk_position < 0
-            or chunk_position >= len(_chunks)
-            or float(distance) > MAX_COLLEGE_RETRIEVAL_DISTANCE
-        ):
-            continue
-        chunk = _chunks[chunk_position]
-        context_parts.append(
-            f"Official Sri Sairam Engineering College source: "
-            f"{chunk.page_title}\nURL: {chunk.source_url}\n{chunk.content}"
+    with _index_lock:
+        if db is not None and _index_version != _database_version(db):
+            rebuild_college_index(db)
+        if _index is None or not _chunks:
+            return "", []
+        query_embedding = create_embeddings([question])
+        distances, indices = search(
+            _index,
+            query_embedding,
+            top_k=min(MAX_COLLEGE_RETRIEVAL_CHUNKS, len(_chunks)),
         )
-        if chunk.source_id not in seen_sources:
-            sources.append(
-                {
-                    "id": chunk.source_id,
-                    "filename": chunk.page_title,
-                    "title": chunk.page_title,
-                    "url": chunk.source_url,
-                    "source_type": "college_website",
-                }
+        context_parts = []
+        sources = []
+        seen_sources = set()
+        for distance, chunk_position in zip(distances[0], indices[0]):
+            if (
+                chunk_position < 0
+                or chunk_position >= len(_chunks)
+                or float(distance) > MAX_COLLEGE_RETRIEVAL_DISTANCE
+            ):
+                continue
+            chunk = _chunks[chunk_position]
+            context_parts.append(
+                f"Official Sri Sairam Engineering College source: "
+                f"{chunk.page_title}\nURL: {chunk.source_url}\n{chunk.content}"
             )
-            seen_sources.add(chunk.source_id)
-        if len(context_parts) >= MAX_COLLEGE_CONTEXT_CHUNKS:
-            break
-    return "\n\n".join(context_parts), sources
+            if chunk.source_id not in seen_sources:
+                sources.append(
+                    {
+                        "id": chunk.source_id,
+                        "filename": chunk.page_title,
+                        "title": chunk.page_title,
+                        "url": chunk.source_url,
+                        "source_type": "college_website",
+                    }
+                )
+                seen_sources.add(chunk.source_id)
+            if len(context_parts) >= MAX_COLLEGE_CONTEXT_CHUNKS:
+                break
+        return "\n\n".join(context_parts), sources
 
 
 def record_fetch_failure(db: Session, source_url: str, error_code: str):

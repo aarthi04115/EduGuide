@@ -1,10 +1,37 @@
-from sentence_transformers import SentenceTransformer
+from functools import lru_cache
+from threading import Lock
 
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+_embedding_lock = Lock()
+
+
+@lru_cache(maxsize=1)
+def get_embedding_model():
+    import torch
+    from sentence_transformers import SentenceTransformer
+
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+    return SentenceTransformer(
+        "all-MiniLM-L6-v2",
+        model_kwargs={
+            "torch_dtype": torch.float16,
+            "low_cpu_mem_usage": True,
+        },
+    )
 
 
 def create_embeddings(chunks):
-    embeddings = model.encode(chunks)
+    if not chunks:
+        return []
+
+    with _embedding_lock:
+        model = get_embedding_model()
+        embeddings = model.encode(
+            chunks,
+            batch_size=32,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
 
     return embeddings

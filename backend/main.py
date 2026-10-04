@@ -14,7 +14,6 @@ from sqlalchemy.exc import IntegrityError, OperationalError, ProgrammingError, S
 from sqlalchemy.orm import Session
 
 from auth import router as auth_router
-from college_knowledge import rebuild_college_index
 from database import Base, SessionLocal, engine, get_db
 from models import AuthSession, Conversation, Document, Message, User
 from rag_pipeline import answer_question
@@ -31,8 +30,8 @@ from schemas import (
 from security import csrf_protection, get_current_user
 from study_materials import (
     add_material,
-    get_material,
     initialize_materials,
+    load_material,
     list_materials,
     remove_material,
 )
@@ -66,17 +65,11 @@ async def lifespan(_app):
                 )
             else:
                 with SessionLocal() as db:
-                    initialize_materials(db)
-                    try:
-                        chunk_count = rebuild_college_index(db)
-                        logger.info(
-                            "Loaded %s official college knowledge chunks.",
-                            chunk_count,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Official college knowledge index could not be loaded."
-                        )
+                    document_count = initialize_materials(db)
+                    logger.info(
+                        "Found %s indexed study materials; indexes will load on demand.",
+                        document_count,
+                    )
         except SQLAlchemyError:
             logger.exception(
                 "Database startup check failed; database-backed endpoints may be unavailable."
@@ -191,14 +184,11 @@ def _conversation_or_404(db: Session, conversation_id: str, user_id: str):
 
 
 def _document_response(document):
-    status = document.status
-    if status == "indexed" and get_material(document.id, document.user_id) is None:
-        status = "failed"
     return {
         "id": document.id,
         "filename": document.filename,
         "size": document.file_size,
-        "status": status,
+        "status": document.status,
         "created_at": document.created_at.isoformat(),
     }
 
@@ -397,7 +387,7 @@ def chat(
 
     document_ids = [document.id for document in selected_documents]
     if any(
-        get_material(document.id, user.id) is None
+        load_material(document, user.id) is None
         for document in selected_documents
     ):
         raise HTTPException(
@@ -523,7 +513,7 @@ def attach_document_to_conversation(
             Document.status == "indexed",
         )
     )
-    if document is None or get_material(document.id, user.id) is None:
+    if document is None or load_material(document, user.id) is None:
         raise HTTPException(status_code=404, detail="Study material not found.")
     if all(associated.id != document.id for associated in conversation.documents):
         conversation.documents.append(document)

@@ -1,15 +1,18 @@
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from chunker import create_chunks
 from document_processor import extract_pages_from_file
 from embeddings import create_embeddings
+from index_cache import create_index_for_chunks
 from models import Document
-from retriever import create_index, search
+from retriever import search
 
 
 logger = logging.getLogger(__name__)
@@ -38,8 +41,18 @@ class StudyMaterial:
         return result
 
 
-_materials: dict[str, StudyMaterial] = {}
+MAX_CACHED_MATERIALS = 2
+_materials: OrderedDict[str, StudyMaterial] = OrderedDict()
+_materials_lock = RLock()
 MAX_RETRIEVAL_DISTANCE = 1.3
+
+
+def _remember_material(material):
+    with _materials_lock:
+        _materials[material.document_id] = material
+        _materials.move_to_end(material.document_id)
+        while len(_materials) > MAX_CACHED_MATERIALS:
+            _materials.popitem(last=False)
 
 
 def _chunks_with_pages(pages):
@@ -57,7 +70,7 @@ def add_material(document_id, owner_id, filename, file_path, pages, size):
     if not chunks:
         raise ValueError("The document does not contain readable text.")
 
-    index = create_index(create_embeddings(chunks))
+    index = create_index_for_chunks(chunks, create_embeddings)
     material = StudyMaterial(
         document_id=document_id,
         owner_id=owner_id,
@@ -68,16 +81,37 @@ def add_material(document_id, owner_id, filename, file_path, pages, size):
         page_numbers=page_numbers,
         index=index,
     )
-    _materials[document_id] = material
+    _remember_material(material)
     return material
 
 
 def initialize_materials(db: Session):
-    for document in db.scalars(
-        select(Document).where(Document.status == "indexed")
-    ):
-        if document.id in _materials:
-            continue
+    return (
+        db.scalar(
+            select(func.count(Document.id)).where(Document.status == "indexed")
+        )
+        or 0
+    )
+
+
+def get_material(document_id, owner_id):
+    with _materials_lock:
+        material = _materials.get(document_id)
+        if material is None or material.owner_id != owner_id:
+            return None
+        _materials.move_to_end(document_id)
+        return material
+
+
+def load_material(document: Document, owner_id: str):
+    if document.user_id != owner_id or document.status != "indexed":
+        return None
+
+    with _materials_lock:
+        material = get_material(document.id, owner_id)
+        if material is not None:
+            return material
+
         try:
             pages = extract_pages_from_file(document.storage_path)
             if not any(text.strip() for _, text in pages):
@@ -85,7 +119,7 @@ def initialize_materials(db: Session):
             chunks, page_numbers = _chunks_with_pages(pages)
             if not chunks:
                 raise ValueError("No text chunks were produced.")
-            _materials[document.id] = StudyMaterial(
+            material = StudyMaterial(
                 document_id=document.id,
                 owner_id=document.user_id,
                 filename=document.filename,
@@ -93,25 +127,15 @@ def initialize_materials(db: Session):
                 size=document.file_size,
                 chunks=chunks,
                 page_numbers=page_numbers,
-                index=create_index(create_embeddings(chunks)),
+                index=create_index_for_chunks(chunks, create_embeddings),
             )
+            _remember_material(material)
+            return material
         except (OSError, ValueError):
-            logger.warning(
-                "Could not restore indexed study material %s.",
-                document.id,
-            )
+            logger.warning("Could not load indexed study material %s.", document.id)
         except Exception:
-            logger.exception(
-                "Failed to restore indexed study material %s.",
-                document.id,
-            )
-
-
-def get_material(document_id, owner_id):
-    material = _materials.get(document_id)
-    if material is None or material.owner_id != owner_id:
-        return None
-    return material
+            logger.exception("Failed to load indexed study material %s.", document.id)
+    return None
 
 
 def list_materials(owner_id, db: Session):
@@ -125,12 +149,7 @@ def list_materials(owner_id, db: Session):
             "id": document.id,
             "filename": document.filename,
             "size": document.file_size,
-            "status": (
-                "failed"
-                if document.status == "indexed"
-                and get_material(document.id, owner_id) is None
-                else document.status
-            ),
+            "status": document.status,
             "created_at": document.created_at.isoformat(),
         }
         for document in documents
@@ -138,7 +157,8 @@ def list_materials(owner_id, db: Session):
 
 
 def remove_material(document_id):
-    return _materials.pop(document_id, None)
+    with _materials_lock:
+        return _materials.pop(document_id, None)
 
 
 def retrieve_context(question, document_ids, owner_id):
@@ -146,39 +166,47 @@ def retrieve_context(question, document_ids, owner_id):
     return context
 
 
-def retrieve_context_with_sources(question, document_ids, owner_id):
-    materials = [
-        get_material(document_id, owner_id)
-        for document_id in document_ids
-    ]
-    if any(material is None for material in materials):
-        raise ValueError("A selected study material is not available.")
-
+def retrieve_context_with_sources(question, document_ids, owner_id, db=None):
     query_embedding = create_embeddings([question])
     context_parts = []
     sources = []
-    for material in materials:
-        top_k = min(3, len(material.chunks))
-        distances, indices = search(
-            material.index,
-            query_embedding,
-            top_k=top_k,
-        )
-        for distance, chunk_index in zip(distances[0], indices[0]):
-            if (
-                0 <= chunk_index < len(material.chunks)
-                and float(distance) <= MAX_RETRIEVAL_DISTANCE
-            ):
-                page_number = material.page_numbers[chunk_index]
-                context_parts.append(
-                    f"Study material: {material.filename}, page {page_number}\n"
-                    f"{material.chunks[chunk_index]}"
+    with _materials_lock:
+        for document_id in document_ids:
+            material = get_material(document_id, owner_id)
+            if material is None and db is not None:
+                document = db.scalar(
+                    select(Document).where(
+                        Document.id == document_id,
+                        Document.user_id == owner_id,
+                        Document.status == "indexed",
+                    )
                 )
-                source = {
-                    "id": material.document_id,
-                    "filename": material.filename,
-                    "page_number": page_number,
-                }
-                if source not in sources:
-                    sources.append(source)
+                if document is not None:
+                    material = load_material(document, owner_id)
+            if material is None:
+                raise ValueError("A selected study material is not available.")
+
+            top_k = min(3, len(material.chunks))
+            distances, indices = search(
+                material.index,
+                query_embedding,
+                top_k=top_k,
+            )
+            for distance, chunk_index in zip(distances[0], indices[0]):
+                if (
+                    0 <= chunk_index < len(material.chunks)
+                    and float(distance) <= MAX_RETRIEVAL_DISTANCE
+                ):
+                    page_number = material.page_numbers[chunk_index]
+                    context_parts.append(
+                        f"Study material: {material.filename}, page {page_number}\n"
+                        f"{material.chunks[chunk_index]}"
+                    )
+                    source = {
+                        "id": material.document_id,
+                        "filename": material.filename,
+                        "page_number": page_number,
+                    }
+                    if source not in sources:
+                        sources.append(source)
     return "\n\n".join(context_parts), sources
